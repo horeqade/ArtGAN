@@ -96,8 +96,8 @@ def get_images(indices: List[int], data: List[str], batch_size: int, img_shape: 
     return x_train
 
 
-def get_images_classes(batch_size: int, data: List[str], classes: dict, img_shape: Tuple[int, int, int],
-                       batch_num: int, indexes: List[int] = None):
+def get_images_classes(batch_size: int, data: List[str], classes: dict, img_shape: Tuple[int],
+                       batch_num: int, channel_first: bool = False):
     """
     Function not using
     Args:
@@ -110,17 +110,17 @@ def get_images_classes(batch_size: int, data: List[str], classes: dict, img_shap
     Returns:
 
     """
-    img_rows, img_cols, img_channels = img_shape
-    X_train = np.zeros((batch_size, img_rows, img_cols, img_channels))
+    if channel_first:
+        img_channels, img_rows, img_cols = img_shape
+        X_train = np.zeros((batch_size, img_channels, img_rows, img_cols))
+    else:
+        img_rows, img_cols, img_channels = img_shape
+        X_train = np.zeros((batch_size, img_rows, img_cols, img_channels))
     y_labels = np.zeros(batch_size)
-    # if indexes is not None:
-    #     choice_arr = indexes
-    # else:
-    #     choice_arr = np.random.randint(0, len(data), batch_size)
 
     for i in range(batch_size):
         # img_path = data[choice_arr[i]]
-        img_path = data[batch_num*batch_size + i]
+        img_path = data[batch_num * batch_size + i]
         temp_img = Image.open(img_path)
 
         if temp_img.mode != 'RGB':
@@ -128,6 +128,8 @@ def get_images_classes(batch_size: int, data: List[str], classes: dict, img_shap
 
         style = img_path.split('\\')[-2]
         temp_img = np.array(temp_img)
+        if channel_first:
+            temp_img = np.transpose(temp_img, (2, 0, 1))
         temp_img = (temp_img - 127.5) / 127.5
         X_train[i] = temp_img
         y_labels[i] = classes[style]
@@ -135,6 +137,31 @@ def get_images_classes(batch_size: int, data: List[str], classes: dict, img_shap
     return X_train, y_labels
 
 
+def get_one_image(batch_size: int, data: List[str], classes: dict, img_shape: Tuple[int], img_idx: int = 0,
+                  channel_first: bool = False):
+    if channel_first:
+        img_channels, img_rows, img_cols = img_shape
+        X_train = np.zeros((batch_size, img_channels, img_rows, img_cols))
+    else:
+        img_rows, img_cols, img_channels = img_shape
+        X_train = np.zeros((batch_size, img_rows, img_cols, img_channels))
+    y_labels = np.zeros(batch_size)
+    for i in range(batch_size):
+        # img_path = data[choice_arr[i]]
+        img_path = data[img_idx]
+        temp_img = Image.open(img_path)
+        if temp_img.mode != 'RGB':
+            temp_img = temp_img.convert('RGB')
+
+        style = img_path.split('\\')[-2]
+        temp_img = np.array(temp_img)
+        if channel_first:
+            temp_img = np.transpose(temp_img, (2, 0, 1))
+        temp_img = (temp_img - 127.5) / 127.5
+        X_train[i] = temp_img
+        y_labels[i] = classes[style]
+
+    return X_train, y_labels
 
 
 def get_images_one_class(batch_size, data, class_target, img_shape):

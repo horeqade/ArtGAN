@@ -1,83 +1,108 @@
 from math import log2
 from typing import Tuple
 
-from tensorflow._api.v1.keras.layers import (Dense, Activation, Reshape, Flatten, Dropout, Input, LeakyReLU, Conv2D,
-                                     Conv2DTranspose, BatchNormalization)
-from tensorflow._api.v1.keras.models import Sequential, Model
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
 
 
-def generator_containing_discriminator(g: Model, d: Model, d_label: Model, latent_dim: int = 100):
-    noise = Input(shape=(latent_dim,))
-    img = g(noise)
-    d.trainable = False
-    d_label.trainable = False
-    valid, target_label = d(img), d_label(img)
+class Generator(nn.Module):
+    def __init__(self, img_shape: Tuple[int], generator_params: dict, generator_type: str = 'dcnn',
+                 latent_dim: int = 100):
+        super(Generator, self).__init__()
+        self.img_shape = img_shape
+        self.latent_dim = latent_dim
+        self.generator_type = generator_type
+        if generator_type == 'dcnn':
+            self.GenConvModel = nn.Sequential()
+            self.GenDenseModel = nn.Sequential()
+            self.build_dcnn_generator(**generator_params)
 
-    return Model(noise, [valid, target_label])
+    def build_dcnn_generator(self, dense_shape: Tuple[int, int, int], nlastfilters: int = 64,
+                             filter_size: Tuple[int] = (3, 3), lrelu_coef: float = 0.2):
+        self.dense_shape = dense_shape
+
+        img_width = self.img_shape[1]
+        layers_cnt = int(log2(img_width) - log2(dense_shape[1]))
+        dense_units = dense_shape[0] * dense_shape[1] * dense_shape[2]
+        padding = int((filter_size[0] - 1) / 2)
+
+        self.GenDenseModel.add_module('LatentDense', nn.Linear(self.latent_dim, dense_units))
+        self.GenDenseModel.add_module('LatentBN', nn.BatchNorm1d(dense_units))
+        self.GenDenseModel.add_module('LatentLReLU', nn.LeakyReLU(lrelu_coef))
+
+        infilters = 0
+        for i in range(layers_cnt):
+            outfilters = nlastfilters * pow(2, layers_cnt - i - 1)
+            if infilters == 0:
+                infilters = dense_shape[0]
+            else:
+                infilters = nlastfilters * pow(2, layers_cnt - i)
+            self.GenConvModel.add_module(f'ConvTranspose_{i}', nn.ConvTranspose2d(infilters, outfilters, filter_size, 2,
+                                                                                  padding, output_padding=1))
+            self.GenConvModel.add_module(f'BN_{i}', nn.BatchNorm2d(outfilters))
+            self.GenConvModel.add_module(f'LReLU_{i}', nn.LeakyReLU(lrelu_coef, True))
+
+        self.GenConvModel.add_module('FinalConvTranspose',
+                        nn.ConvTranspose2d(nlastfilters, self.img_shape[0], filter_size, 1, padding))
+        self.GenConvModel.add_module('LastLReLU', nn.LeakyReLU(lrelu_coef, True))
+
+    def forward(self, x):
+        x = self.GenDenseModel(x)
+        x = x.view(x.shape[0], *self.dense_shape)
+        x = self.GenConvModel(x)
+
+        return x
 
 
-def build_dcnn_generator(img_shape: Tuple[int], dense_shape: Tuple[int, int, int], init_filters_cnt: int,
-                         img_channels: int = 3, input_dim: int = 100, filter_size: Tuple[int] = (3, 3)):
-    out_side = img_shape[0]
-    layers_cnt = int(log2(out_side) - log2(dense_shape[0]))
-    dense_units = dense_shape[0] * dense_shape[1] * dense_shape[2]
+class Discriminator(nn.Module):
+    def __init__(self, img_shape: Tuple[int], generator_params: dict,
+                 generator_type: str = 'dcnn_classes'):
+        super(Discriminator, self).__init__()
+        self.img_shape = img_shape
+        if generator_type == 'dcnn_classes':
+            self.build_dcnn_classes_discriminator(**generator_params)
 
-    model = Sequential(name='Generator')
-    model.add(Dense(dense_units, input_dim=input_dim))
-    # model.add(BatchNormalization())
-    model.add(LeakyReLU())
-    model.add(Reshape((dense_shape)))
+    def build_dcnn_classes_discriminator(self, num_classes: int, init_filter_cnt: int = 64, lrelu_coef: float = 0.2,
+                                         conv_cnt: int = 6, filter_size: Tuple[int] = (3, 3), drop_rate: float = 0.25):
+        self.n_classes = num_classes
+        self.nconv = conv_cnt
+        padding = int((filter_size[0] - 1) / 2)
 
-    filters_denum = 1
-    for i in range(layers_cnt):
-        model.add(Conv2DTranspose(int(init_filters_cnt / filters_denum), filter_size, strides=(2,2), padding='same'))
-        # model.add(BatchNormalization())
-        model.add(LeakyReLU())
-        filters_denum *= 2
+        self.Featurizer = nn.Sequential()
 
-    model.add(Conv2DTranspose(img_channels, filter_size, strides=(1, 1), padding='same'))
-    model.add(Activation("tanh"))
+        self.Featurizer.add_module(f'FeaturizerConv_0', nn.Conv2d(self.img_shape[0], init_filter_cnt, filter_size, 2, padding))
+        self.Featurizer.add_module(f'FeaturizerLReLU_0', nn.LeakyReLU(lrelu_coef))
 
-    model.summary()
+        outfilters = init_filter_cnt * 2
+        infilters = init_filter_cnt
+        for i in range(self.nconv - 1):
+            self.Featurizer.add_module(f'FeaturizerConv_{i + 1}', nn.Conv2d(infilters, outfilters, filter_size, 2, padding))
+            self.Featurizer.add_module(f'FeaturizerBN_{i + 1}', nn.BatchNorm2d(outfilters))
+            self.Featurizer.add_module(f'FeaturizerLReLU_{i + 1}', nn.LeakyReLU(lrelu_coef))
 
-    return model
+            infilters = outfilters
+            outfilters *= 2
 
+        out_size = int(self.img_shape[1]/pow(2, conv_cnt))
+        nfeats = infilters * out_size * out_size
+        self.ValidModel = nn.Sequential(
+            nn.Linear(nfeats, 1)
+        )
+        self.ClassModel = nn.Sequential(
+            nn.Linear(nfeats, 512),
+            nn.LeakyReLU(lrelu_coef),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(lrelu_coef),
+            nn.Linear(256, self.n_classes),
+        )
 
-def build_dcnn_discriminator_classes(num_classes: int, img_shape: Tuple[int], init_filter_cnt: int = 64,
-                                     conv_cnt: int = 6, filter_size: Tuple[int] = (3, 3), drop_rate: float = 0.5):
-    model = Sequential(name='FeatureExtractor')
+    def forward(self, x):
+        x = self.Featurizer(x)
+        x = x.view(x.shape[0], -1)
 
-    model.add(Conv2D(init_filter_cnt, kernel_size=filter_size, strides=(2, 2), input_shape=img_shape, padding="same"))
-    # model.add(BatchNormalization())
-    model.add(LeakyReLU(0.2))
-    # model.add(Dropout(drop_rate))
+        valid = self.ValidModel(x)
+        classification = self.ClassModel(x)
 
-    filters_cnt = init_filter_cnt * 2
-    for i in range(conv_cnt - 1):
-        model.add(Conv2D(filters_cnt, kernel_size=filter_size, strides=(2, 2), padding="same"))
-        model.add(BatchNormalization())
-        model.add(LeakyReLU(0.2))
-        # model.add(Dropout(drop_rate))
-        filters_cnt *= 2
-
-    model.add(Flatten())
-    model.summary()
-
-    img = Input(shape=img_shape)
-
-    features = model(img)
-
-    validity = Dense(1)(features)
-    valid = Activation('sigmoid')(validity)
-
-    label1 = Dense(int(filters_cnt/2))(features)
-    bn1 = BatchNormalization()(label1)
-    lrelu1 = LeakyReLU()(bn1)
-    label2 = Dense(int(filters_cnt/4))(lrelu1)
-    bn2 = BatchNormalization()(label2)
-    lrelu2 = LeakyReLU()(bn2)
-    label3 = Dense(num_classes)(lrelu2)
-    label = Activation('softmax')(label3)
-
-    return Model(img, valid, name='Discriminator'), Model(img, label, name='ClassDiscriminator')
-    # return Model(img, [valid, label])
+        return valid, classification

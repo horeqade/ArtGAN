@@ -1,182 +1,185 @@
 from datetime import date
+from typing import Tuple
 import os
 
 from PIL import Image
 from PIL import ImageFile
-from tensorflow._api.v1.keras.optimizers import Adam, SGD
-from tensorflow._api.v1.keras.utils import to_categorical
-import tensorflow._api.v1.keras.backend as K
 import numpy as np
 import matplotlib.pyplot as plt
+import torch
+from torch.autograd import Variable
+from torchsummary import summary
+from sklearn.preprocessing import LabelBinarizer
 
-from ArtistAI.model import build_dcnn_generator, build_dcnn_discriminator_classes, generator_containing_discriminator
-from ArtistAI.data_processor import get_data, get_images_classes, combine_images
-from ArtistAI.util import get_layer_output_grad, get_gradients
+from ArtistAI.model import Generator, Discriminator
+from ArtistAI.data_processor import get_data, get_images_classes, combine_images, get_one_image
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
-def wasserstein_loss(y_true, y_pred):
-    return K.mean(y_true * y_pred)
+class WasserteineLoss(torch.nn.Module):
+    def __init__(self):
+        super(WasserteineLoss, self).__init__()
+
+    def forward(self, predict, target):
+        pass
 
 
+def weights_init_normal(m):
+    classname = m.__class__.__name__
+    if classname.find("Conv") != -1:
+        torch.nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find("BatchNorm2d") != -1:
+        torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
+        torch.nn.init.constant_(m.bias.data, 0.0)
 
 
-def model_saver(generator, discriminator, d_label, epoch: int):
+def model_saver(generator, discriminator, epoch: int):
     date_today = date.today()
 
     month, day = date_today.month, date_today.day
 
-    # Генерируем описание модели в формате json
-    d_json = discriminator.to_json()
-    # Записываем модель в файл
-    json_file = open(os.getcwd() + "/jsons/%d.%d dis_model.json" % (day, month), "w")
-    json_file.write(d_json)
-    json_file.close()
 
-    # Генерируем описание модели в формате json
-    d_l_json = d_label.to_json()
-    # Записываем модель в файл
-    json_file = open(os.getcwd() + "/jsons/%d.%d dis_label_model.json" % (day, month), "w")
-    json_file.write(d_l_json)
-    json_file.close()
-
-    # Генерируем описание модели в формате json
-    gen_json = generator.to_json()
-    # Записываем модель в файл
-    json_file = open(os.getcwd() + "/jsons/%d.%d gen_model.json" % (day, month), "w")
-    json_file.write(gen_json)
-    json_file.close()
 
     discriminator.save_weights(os.getcwd() + '/weights/%d.%d %d_epoch dis_weights.h5' % (day, month, epoch))
-    d_label.save_weights(os.getcwd() + '/weights/%d.%d %d_epoch dis_label_weights.h5' % (day, month, epoch))
     generator.save_weights(os.getcwd() + '/weights/%d.%d %d_epoch gen_weights.h5' % (day, month, epoch))
 
 
-def train_another(data_path: str, gen_params: dict, discr_params: dict, epochs=100, BATCH_SIZE=4, weights=False,
-                  month_day='', epoch_ini=0, missing_folders=[],
+def train_another(data_path: str, gen_params: dict, discr_params: dict, optimizator_params: dict, img_shape: Tuple[int],
+                  epochs=100, BATCH_SIZE=4, weights=False, month_day='', epoch_ini=0, missing_folders=[],
                   gif=False, folders=None):
+    latent_dim = 100
     gif_i = 0
     if not gif:
         save_folder = 'generated'
     else:
         save_folder = 'generated_gif'
     data, num_styles, classes = get_data(data_path, missing_folders, folders)
+    print(data[6])
     discr_params['num_classes'] = num_styles
+    label_bin = LabelBinarizer()
+    label_bin.fit(list(range(num_styles)))
 
     epoch = ' ' + str(epoch_ini) + '_epoch'
 
-    generator = build_dcnn_generator(**gen_params)
-    discriminator, d_label = build_dcnn_discriminator_classes(**discr_params)
+    netG = Generator(img_shape, gen_params)
+    netD = Discriminator(img_shape, discr_params)
 
-    if month_day != '':
-        generator.load_weights(os.getcwd() + '/weights/' + month_day + epoch + ' gen_weights.h5', by_name=True)
-        discriminator.load_weights(os.getcwd() + '/weights/' + month_day + epoch + ' dis_weights.h5', by_name=True)
-        d_label.load_weights(os.getcwd() + '/weights/' + month_day + epoch + ' dis_label_weights.h5', by_name=True)
+    cuda = torch.cuda.is_available()
+    if cuda:
+        netG.cuda()
+        netD.cuda()
 
-    dcgan = generator_containing_discriminator(generator, discriminator, d_label)
+    print(summary(netD, img_shape))
+    print(summary(netG, (100,)))
 
-    discriminator.compile(loss=losses[0], optimizer=d_optim)
-    d_label.compile(loss=losses[1], optimizer=d_optim)
-    generator.compile(loss=losses[0], optimizer=g_optim)
-    dcgan.compile(loss=losses[0], optimizer=g_optim)
+    netG.apply(weights_init_normal)
+    netD.apply(weights_init_normal)
 
-    noise = np.random.normal(0, 1, (BATCH_SIZE, latent_dim))
-    real = np.ones(BATCH_SIZE)
-    fake = np.zeros(BATCH_SIZE)
+    if optimizator_params['type'] == 'Adam':
+        lr = optimizator_params['lr']
+        b1 = optimizator_params['b1']
+        b2 = optimizator_params['b2']
+        optimizer_g = torch.optim.Adam(netG.parameters(), lr=lr, betas=(b1, b2))
+        optimizer_d = torch.optim.Adam(netD.parameters(), lr=lr, betas=(b1, b2))
+    else:
+        optimizer_g = torch.optim.SGD(netG.parameters(), lr=0.0002, momentum=True)
+        optimizer_d = torch.optim.SGD(netD.parameters(), lr=0.0002, momentum=True)
+
+    loss_d = torch.nn.BCELoss()
+    loss_d_label = torch.nn.CrossEntropyLoss()
+
+    Tensor = torch.cuda.FloatTensor
+
     for epoch in range(epoch_ini, epochs):
-        if epoch % 5 == 0:
-            model_saver(generator, discriminator, d_label, epoch)
+        # if epoch % 5 == 0:
+        #     model_saver(generator, discriminator, d_label, epoch)
         for index in range(int(len(data) / BATCH_SIZE)):
+            # real_images, real_labels = get_images_classes(BATCH_SIZE, data, classes, gen_params['img_shape'],
+            #                                              batch_num=index, channel_first=True,)
+            valid = Variable(Tensor(BATCH_SIZE, 1).fill_(1.0), requires_grad=False)
+            fake = Variable(Tensor(BATCH_SIZE, 1).fill_(0.0), requires_grad=False)
 
-            if not gif:
-                noise = np.random.normal(0, 1, (BATCH_SIZE, latent_dim))
-            generated_images = generator.predict(noise)
+            real_images, real_labels = get_one_image(BATCH_SIZE, data, classes, img_shape, channel_first=True,
+                                                     img_idx=6)
+            real_images = Variable(torch.from_numpy(real_images).cuda().type(torch.float32))
+            real_labels = Variable(torch.from_numpy(real_labels).cuda().type(torch.long))
 
-            real_images, real_labels = get_images_classes(BATCH_SIZE, data, classes, gen_params['img_shape'],
-                                                          batch_num=index)
-
+            optimizer_d.zero_grad()
             if index % 2 == 0:
+                # Train on real images
+
                 X = real_images
-                # y_classif = real_labels - 0.2 + np.random.rand(BATCH_SIZE) * 0.2
-                y_classif = to_categorical(np.zeros(BATCH_SIZE) + real_labels, num_styles)
-                #y = 0.7 + np.random.rand(BATCH_SIZE) * 0.3
-                # y = np.ones(BATCH_SIZE)
+                y_classif = real_labels
+
+                d_validation, d_class = netD(X)
+
+                # d_real_loss = loss_d(d_validation, valid)
+                d_real_loss = -torch.mean(d_validation)
 
                 d_loss = []
-                d_loss.append(discriminator.train_on_batch(X, real))
+                d_loss.append(d_real_loss)
                 if num_styles > 1:
-                    d_loss.append(d_label.train_on_batch(X, y_classif))
-                    print("epoch %d batch %d d_loss : %f, label_loss: %f" % (epoch, index, d_loss[0], d_loss[1]))
+                    d_label_real_loss = loss_d_label(d_class, y_classif)
+                    d_loss.append(d_label_real_loss)
+                    print("epoch %d batch %d D_validity_loss : %f, D_label_loss: %f" % (
+                        epoch, index, d_loss[0], d_loss[1]))
                 else:
                     print(f'epoch {epoch} batch {index} d_loss : {d_loss[0]}')
 
-                # X = generated_images
-                # y = np.random.rand(BATCH_SIZE) * 0.2
-                # # y = np.zeros(BATCH_SIZE)
-                # d_loss = discriminator.train_on_batch(X, fake)
-                #
-                # print("epoch %d batch %d d_gen_loss  : %f" % (epoch, index, d_loss))
+                d_total_real_loss = d_real_loss + d_label_real_loss
+                d_total_real_loss.backward()
+                optimizer_d.step()
+
             else:
-                X = generated_images
-                # y = np.random.rand(BATCH_SIZE) * 0.3
-                # y = np.zeros(BATCH_SIZE)
-                d_loss = discriminator.train_on_batch(X, fake)
+                # Train on artificial images
 
-                print("epoch %d batch %d d_gen_loss  : %f" % (epoch, index, d_loss))
+                z = Variable(Tensor(np.random.normal(0, 1, (BATCH_SIZE, latent_dim))))
+                X = netG(z)
+                d_validation, d_class = netD(X)
 
-                # X = real_images
-                # # real_labels = real_labels - 0.1 + np.random.rand(BATCH_SIZE) * 0.2
-                # y_classif = to_categorical(np.zeros(BATCH_SIZE) + real_labels, num_styles)
-                # y = 0.8 + np.random.rand(BATCH_SIZE) * 0.2
-                # # y = np.ones(BATCH_SIZE)
-                #
-                # d_loss = []
-                # d_loss.append(discriminator.train_on_batch(X, y))
-                # # discriminator.trainable = False
-                # if num_styles > 1:
-                #     d_loss.append(d_label.train_on_batch(X, y_classif))
-                #     print("epoch %d batch %d d_loss : %f, label_loss: %f" % (epoch, index, d_loss[0], d_loss[1]))
-                # else:
-                #     print(f'epoch {epoch} batch {index} d_loss : {d_loss[0]}')
+                # d_fake_loss = loss_d(d_validation, fake)
+                d_fake_loss = torch.mean(d_validation)
 
+                print("epoch %d batch %d d_gen_loss  : %f" % (epoch, index, d_fake_loss))
+
+                d_fake_loss.backward()
+                optimizer_d.step()
             if not gif:
-                noise = np.random.normal(0, 1, (BATCH_SIZE, latent_dim))
+                z = Variable(Tensor(np.random.normal(0, 1, (BATCH_SIZE, latent_dim))))
+            optimizer_g.zero_grad()
 
-            # y_classif = keras.utils.to_categorical(np.zeros(BATCH_SIZE) + 1/num_styles, num_styles)
             target_classif_value = 1 / num_styles
-            y_classif = np.zeros((BATCH_SIZE, num_styles))
-            y_classif[:, 1] = 1
+            y_classif = np.zeros((BATCH_SIZE)) + 1
+            y_classif = Variable(torch.from_numpy(y_classif).cuda().type(torch.long))
 
-            # y = 0.7 + np.random.rand(BATCH_SIZE) * 0.3
+            fake_images = netG(z)
+            d_validation, d_class = netD(fake_images)
 
-            g_loss = dcgan.train_on_batch(noise, [real, y_classif])
-            print("epoch %d batch %d g_loss     : %f" % (epoch, index, g_loss[0]))
+            # g_valid_loss = loss_d(d_validation, valid)
+            g_valid_loss = -torch.mean(d_validation)
+            d_loss = []
+            d_loss.append(g_valid_loss)
+            if num_styles > 1:
+                g_label_loss = loss_d_label(d_class, y_classif)
+                d_loss.append(d_label_real_loss)
+                print("epoch %d batch %d G_validity_loss : %f, G_label_loss: %f" % (epoch, index, d_loss[0], d_loss[1]))
+                g_total_loss = g_valid_loss + g_label_loss
+            else:
+                print(f'epoch {epoch} batch {index} d_loss : {d_loss[0]}')
+                g_total_loss = g_valid_loss
 
-            # print(dcgan.optimizer)
-            # print(get_layer_output_grad(dcgan, noise, [y, y_classif], layer=0))
-            # gradients = get_gradients(dcgan)
-            # input_tensors = [
-            #     dcgan.inputs[0],
-            #     dcgan.sample_weights[0],
-            #     dcgan.targets,
-            #     K.learning_phase()
-            # ]
-            # get_gradients_f = K.function(inputs=input_tensors, outputs=gradients)
-            # inputs = [
-            #     noise,
-            #     [1],
-            #     [y, y_classif],
-            #     0
-            # ]
-            # print(get_gradients(dcgan), get_gradients_f(inputs))
+            g_total_loss.backward()
+            optimizer_g.step()
 
+            print()
             if not gif:
                 index_diviser = 50
             else:
                 index_diviser = 10
             if index % index_diviser == 0:
-                image = combine_images(generated_images)
+                fake_images = np.transpose(fake_images.cpu().detach().numpy(), (0, 2, 3, 1))
+                image = combine_images(fake_images)
                 image = image * 127.5 + 127.5
                 image = Image.fromarray(image.astype('uint8'))
                 if not gif:
@@ -184,21 +187,14 @@ def train_another(data_path: str, gen_params: dict, discr_params: dict, epochs=1
                 else:
                     img_name = '%06d.png' % (gif_i)
                 image.save(os.path.join(save_folder, img_name))
-                # cv2.imwrite(
-                #    os.getcwd() + '\\%s\\%s' % (save_folder, img_name), image)
                 gif_i += 1
-                # image = Image.fromarray(combine_images(real_images).astype('uint8'))
-                # image = image*127.5+127.5
-                # image.save(os.path.join(save_folder, img_name))
-                # cv2.imwrite(
-                #    os.getcwd() + '\\%s\\%s' % (save_folder, img_name), image)
 
 
 if __name__ == '__main__':
     img_rows = 64
     img_cols = 64
     img_channels = 3
-    img_shape = (img_rows, img_cols, img_channels)
+    img_shape = (img_channels, img_rows, img_cols)
     latent_dim = 100
     filter_size_g = (5, 5)
     filter_size_d = (5, 5)
@@ -211,27 +207,23 @@ if __name__ == '__main__':
     # losses = [wasserstein_loss, wasserstein_loss]
 
     gen_params = {
-        'img_shape': img_shape,
-        'dense_shape': (4, 4, 1024),
-        'init_filters_cnt': 512,
-        'img_channels': 3,
+        'dense_shape': (1024, 2, 2),
+        'nlastfilters': 64,
         'filter_size': filter_size_g
     }
 
     dis_params = {
-        'img_shape': img_shape,
-        'init_filter_cnt': 128,
-        'conv_cnt': 3,
+        'init_filter_cnt': 16,
+        'conv_cnt': 2,
         'drop_rate': 0.2,
         'filter_size': filter_size_d
     }
-
-    # g_optim = SGD(lr=0.0002, momentum=0.9, nesterov=True)
-    # d_optim = SGD(lr=0.0002, momentum=0.9, nesterov=True)
-    # g_optim = Adam(0.0002, beta_2 = 0.9)
-    # d_optim = Adam(0.0002, beta_2 = 0.9)
-    g_optim = Adam(0.0005, beta_2=0.5)
-    d_optim = Adam(0.0005, beta_2=0.5)
-
-train_another(data_folder, gen_params, dis_params, 100, 64, epoch_ini=0, month_day='', missing_folders=[],
-              folders=['realizm', 'zhivopis-tsvetovogo-polya'], gif=False)
+    optimizator_params = {
+        'type': 'Adam',
+        'lr': 0.0002,
+        'b1': 0.5,
+        'b2': 0.999
+    }
+    train_another(data_folder, gen_params, dis_params, optimizator_params, img_shape, 100, 64, epoch_ini=0,
+                  month_day='',
+                  missing_folders=[], folders=['realizm', 'zhivopis-tsvetovogo-polya'], gif=False)
