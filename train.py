@@ -1,20 +1,23 @@
 from datetime import date
-from typing import Tuple
-import os
+from os import getcwd, makedirs
+from os.path import join, exists
+from typing import Tuple, List
+import shutil
 
+import numpy as np
+import torch
 from PIL import Image
 from PIL import ImageFile
-import numpy as np
-import matplotlib.pyplot as plt
-import torch
+from sklearn.preprocessing import LabelBinarizer
 from torch.autograd import Variable
 from torchsummary import summary
-from sklearn.preprocessing import LabelBinarizer
 
-from ArtistAI.model import Generator, Discriminator
 from ArtistAI.data_processor import get_data, get_images_classes, combine_images, get_one_image
+from ArtistAI.model import Generator, Discriminator
+from ArtistAI.util import model_saver
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+save_path = join(getcwd(), 'saved_model')
 
 
 class WasserteineLoss(torch.nn.Module):
@@ -25,6 +28,170 @@ class WasserteineLoss(torch.nn.Module):
         pass
 
 
+class TrainerGAN:
+    def __init__(self, data_path: str, missing_folders: List[str] = [], folders: List[str] = None):
+        self.data, self.num_styles, self.classes = get_data(data_path, missing_folders, folders)
+        self.label_bin = LabelBinarizer()
+        self.label_bin.fit(list(range(self.num_styles)))
+        self.img_shape = (3, int(data_path.split('images')[1]), int(data_path.split('images')[1]))
+
+        self.netG = self.netD = self.optimizer_g = self.optimizer_d = None
+        self.epoch_ini = 0
+
+    def init_model(self, gen_params: dict, discr_params: dict, optimizator_params: dict,
+                   month_day: str = None, epoch_ini: int = None):
+        self.z_shape = gen_params['z_shape']
+        discr_params['num_classes'] = self.num_styles
+        self.netG = Generator(self.img_shape, gen_params)
+        self.netD = Discriminator(self.img_shape, discr_params)
+        self.optimizer_g, self.optimizer_d = self.load_optimizer_(optimizator_params)
+        self.loss_d_label = torch.nn.CrossEntropyLoss()
+
+        cuda = torch.cuda.is_available()
+        if cuda:
+            self.netG.cuda()
+            self.netD.cuda()
+
+        print(summary(self.netD, img_shape))
+        print(summary(self.netG, self.z_shape))
+
+        self.netG.apply(self.weights_init_normal_)
+        self.netD.apply(self.weights_init_normal_)
+
+    def train(self, epochs: int = 100, batch_size: int = 4, gif: bool = False):
+        Tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
+        gif_i = 0
+        if not gif:
+            save_folder = 'generated'
+        else:
+            save_folder = 'generated_gif'
+
+        for epoch in range(self.epoch_ini, epochs):
+            if epoch % 5 == 0:
+                self.model_saver_(epoch)
+            for index in range(int(len(self.data) / batch_size)):
+                # real_images, real_labels = get_images_classes(BATCH_SIZE, data, classes, img_shape,
+                #                                              batch_num=index, channel_first=True, )
+
+                real_images, real_labels = get_one_image(batch_size, self.data, self.classes, self.img_shape,
+                                                         channel_first=True, img_idx=6)
+
+                real_images = Variable(torch.from_numpy(real_images).cuda().type(torch.float32))
+                real_labels = Variable(torch.from_numpy(real_labels).cuda().type(torch.long))
+
+                self.optimizer_d.zero_grad()
+                if index % 2 == 0:
+                    # Train on real images
+
+                    d_validation, d_class = self.netD(real_images)
+                    d_real_loss = -torch.mean(d_validation)
+
+                    if self.num_styles > 1:
+                        d_label_real_loss = self.loss_d_label(d_class, real_labels)
+                        print(f"epoch {epoch} batch {index} D_validity_loss : {d_real_loss}, ",
+                              f"D_label_loss: {d_label_real_loss}")
+                    else:
+                        print(f'epoch {epoch} batch {index} d_loss : {d_real_loss}')
+
+                    d_total_real_loss = d_real_loss + d_label_real_loss
+                    d_total_real_loss.backward()
+                    self.optimizer_d.step()
+
+                else:
+                    # Train on artificial images
+
+                    z = Variable(Tensor(np.random.normal(0, 1, (batch_size, *self.z_shape))))
+                    X = self.netG(z)
+                    d_validation, d_class = self.netD(X)
+
+                    d_fake_loss = torch.mean(d_validation)
+
+                    print(f"epoch {epoch} batch {index} d_gen_loss  : {d_fake_loss}")
+
+                    d_fake_loss.backward()
+                    self.optimizer_d.step()
+                if not gif:
+                    z = Variable(Tensor(np.random.normal(0, 1, (batch_size, *self.z_shape))))
+                self.optimizer_g.zero_grad()
+
+                target_classif_value = 1 / self.num_styles
+                y_classif = np.zeros((batch_size)) + 1
+                y_classif = Variable(torch.from_numpy(y_classif).cuda().type(torch.long))
+
+                fake_images = self.netG(z)
+                d_validation, d_class = self.netD(fake_images)
+
+                # g_valid_loss = loss_d(d_validation, valid)
+                g_valid_loss = -torch.mean(d_validation)
+                if self.num_styles > 1:
+                    g_label_loss = self.loss_d_label(d_class, y_classif)
+                    print(f"epoch {epoch} batch {index} G_validity_loss : {g_valid_loss}, G_label_loss: {g_label_loss}")
+                    g_total_loss = g_valid_loss + g_label_loss
+                else:
+                    print(f'epoch {epoch} batch {index} d_loss : {g_valid_loss}')
+                    g_total_loss = g_valid_loss
+
+                g_total_loss.backward()
+                self.optimizer_g.step()
+
+                print()
+                if not gif:
+                    index_diviser = 50
+                else:
+                    index_diviser = 10
+                if index % index_diviser == 0:
+                    fake_images = np.transpose(fake_images.cpu().detach().numpy(), (0, 2, 3, 1))
+                    image = combine_images(fake_images)
+                    image = image * 127.5 + 127.5
+                    image = Image.fromarray(image.astype('uint8'))
+                    if not gif:
+                        img_name = 'epoch%d_%06d.png' % (epoch, index)
+                    else:
+                        img_name = '%06d.png' % (gif_i)
+                    image.save(join(save_folder, img_name))
+                    gif_i += 1
+
+    def load_optimizer_(self, optimizator_params: dict):
+        if optimizator_params['type'] == 'Adam':
+            lr = optimizator_params['lr']
+            b1 = optimizator_params['b1']
+            b2 = optimizator_params['b2']
+            optimizer_g = torch.optim.Adam(self.netG.parameters(), lr=lr, betas=(b1, b2))
+            optimizer_d = torch.optim.Adam(self.netD.parameters(), lr=lr, betas=(b1, b2))
+        else:
+            optimizer_g = torch.optim.SGD(self.netG.parameters(), lr=0.0002, momentum=True)
+            optimizer_d = torch.optim.SGD(self.netD.parameters(), lr=0.0002, momentum=True)
+
+        return optimizer_g, optimizer_d
+
+    def weights_init_normal_(self, m):
+        classname = m.__class__.__name__
+        if classname.find("Conv") != -1:
+            torch.nn.init.normal_(m.weight.data, 0.0, 0.02)
+        elif classname.find("BatchNorm2d") != -1:
+            torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
+            torch.nn.init.constant_(m.bias.data, 0.0)
+
+    def model_saver_(self, epoch: int):
+        save_path = join(getcwd(), 'saved_model')
+        date_today = date.today()
+        month, day = date_today.month, date_today.day
+
+        model_folder = join(save_path, f'model_{day}.{month}_{epoch}')
+        generator_folder = join(model_folder, 'generator.pth')
+        discriminator_folder = join(model_folder, 'discriminator.pth')
+
+        if exists(model_folder):
+            shutil.rmtree(model_folder, ignore_errors=False)
+        makedirs(model_folder)
+
+        torch.save({'model_state_dict': self.netG.state_dict()}, generator_folder)
+        torch.save({'model_state_dict': self.netD.state_dict()}, discriminator_folder)
+
+    def model_load_(self, month_day: str, epoch_ini: int):
+        pass
+
+
 def weights_init_normal(m):
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
@@ -32,17 +199,6 @@ def weights_init_normal(m):
     elif classname.find("BatchNorm2d") != -1:
         torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
         torch.nn.init.constant_(m.bias.data, 0.0)
-
-
-def model_saver(generator, discriminator, epoch: int):
-    date_today = date.today()
-
-    month, day = date_today.month, date_today.day
-
-
-
-    discriminator.save_weights(os.getcwd() + '/weights/%d.%d %d_epoch dis_weights.h5' % (day, month, epoch))
-    generator.save_weights(os.getcwd() + '/weights/%d.%d %d_epoch gen_weights.h5' % (day, month, epoch))
 
 
 def train_another(data_path: str, gen_params: dict, discr_params: dict, optimizator_params: dict, img_shape: Tuple[int],
@@ -59,6 +215,7 @@ def train_another(data_path: str, gen_params: dict, discr_params: dict, optimiza
     discr_params['num_classes'] = num_styles
     label_bin = LabelBinarizer()
     label_bin.fit(list(range(num_styles)))
+    z_shape = gen_params['z_shape']
 
     epoch = ' ' + str(epoch_ini) + '_epoch'
 
@@ -71,7 +228,7 @@ def train_another(data_path: str, gen_params: dict, discr_params: dict, optimiza
         netD.cuda()
 
     print(summary(netD, img_shape))
-    print(summary(netG, (100,)))
+    print(summary(netG, z_shape))
 
     netG.apply(weights_init_normal)
     netD.apply(weights_init_normal)
@@ -92,11 +249,11 @@ def train_another(data_path: str, gen_params: dict, discr_params: dict, optimiza
     Tensor = torch.cuda.FloatTensor
 
     for epoch in range(epoch_ini, epochs):
-        # if epoch % 5 == 0:
-        #     model_saver(generator, discriminator, d_label, epoch)
+        if epoch % 5 == 0:
+            model_saver(netG, netD, epoch)
         for index in range(int(len(data) / BATCH_SIZE)):
-            # real_images, real_labels = get_images_classes(BATCH_SIZE, data, classes, gen_params['img_shape'],
-            #                                              batch_num=index, channel_first=True,)
+            real_images, real_labels = get_images_classes(BATCH_SIZE, data, classes, img_shape,
+                                                          batch_num=index, channel_first=True, )
             valid = Variable(Tensor(BATCH_SIZE, 1).fill_(1.0), requires_grad=False)
             fake = Variable(Tensor(BATCH_SIZE, 1).fill_(0.0), requires_grad=False)
 
@@ -134,7 +291,7 @@ def train_another(data_path: str, gen_params: dict, discr_params: dict, optimiza
             else:
                 # Train on artificial images
 
-                z = Variable(Tensor(np.random.normal(0, 1, (BATCH_SIZE, latent_dim))))
+                z = Variable(Tensor(np.random.normal(0, 1, (BATCH_SIZE, *z_shape))))
                 X = netG(z)
                 d_validation, d_class = netD(X)
 
@@ -146,7 +303,7 @@ def train_another(data_path: str, gen_params: dict, discr_params: dict, optimiza
                 d_fake_loss.backward()
                 optimizer_d.step()
             if not gif:
-                z = Variable(Tensor(np.random.normal(0, 1, (BATCH_SIZE, latent_dim))))
+                z = Variable(Tensor(np.random.normal(0, 1, (BATCH_SIZE, *z_shape))))
             optimizer_g.zero_grad()
 
             target_classif_value = 1 / num_styles
@@ -186,7 +343,7 @@ def train_another(data_path: str, gen_params: dict, discr_params: dict, optimiza
                     img_name = 'epoch%d_%06d.png' % (epoch, index)
                 else:
                     img_name = '%06d.png' % (gif_i)
-                image.save(os.path.join(save_folder, img_name))
+                image.save(join(save_folder, img_name))
                 gif_i += 1
 
 
@@ -207,7 +364,7 @@ if __name__ == '__main__':
     # losses = [wasserstein_loss, wasserstein_loss]
 
     gen_params = {
-        'dense_shape': (1024, 2, 2),
+        'z_shape': (128, 2, 2),
         'nlastfilters': 64,
         'filter_size': filter_size_g
     }
@@ -224,6 +381,14 @@ if __name__ == '__main__':
         'b1': 0.5,
         'b2': 0.999
     }
-    train_another(data_folder, gen_params, dis_params, optimizator_params, img_shape, 100, 64, epoch_ini=0,
-                  month_day='',
-                  missing_folders=[], folders=['realizm', 'zhivopis-tsvetovogo-polya'], gif=False)
+    folders = ['abstraktnyy-ekspressionizm', 'zhivopis-tsvetovogo-polya', 'abstraktsionizm', 'minimalizm']
+
+    trainer = TrainerGAN(data_folder, folders = folders)
+    trainer.init_model(gen_params, dis_params, optimizator_params)
+    trainer.train(100, 64)
+
+
+    # train_another(data_folder, gen_params, dis_params, optimizator_params, img_shape, 100, 64, epoch_ini=0,
+    #               month_day='',
+    #               missing_folders=[], folders=['abstraktnyy-ekspressionizm', 'zhivopis-tsvetovogo-polya',
+    #                                            'abstraktsionizm', 'minimalizm'], gif=False)

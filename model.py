@@ -16,29 +16,22 @@ class Generator(nn.Module):
         self.generator_type = generator_type
         if generator_type == 'dcnn':
             self.GenConvModel = nn.Sequential()
-            self.GenDenseModel = nn.Sequential()
             self.build_dcnn_generator(**generator_params)
 
-    def build_dcnn_generator(self, dense_shape: Tuple[int, int, int], nlastfilters: int = 64,
+    def build_dcnn_generator(self, z_shape: Tuple[int], nlastfilters: int = 64,
                              filter_size: Tuple[int] = (3, 3), lrelu_coef: float = 0.2):
-        self.dense_shape = dense_shape
-
         img_width = self.img_shape[1]
-        layers_cnt = int(log2(img_width) - log2(dense_shape[1]))
-        dense_units = dense_shape[0] * dense_shape[1] * dense_shape[2]
+        layers_cnt = int(log2(img_width) - log2(z_shape[1]))
         padding = int((filter_size[0] - 1) / 2)
-
-        self.GenDenseModel.add_module('LatentDense', nn.Linear(self.latent_dim, dense_units))
-        self.GenDenseModel.add_module('LatentBN', nn.BatchNorm1d(dense_units))
-        self.GenDenseModel.add_module('LatentLReLU', nn.LeakyReLU(lrelu_coef))
 
         infilters = 0
         for i in range(layers_cnt):
-            outfilters = nlastfilters * pow(2, layers_cnt - i - 1)
             if infilters == 0:
-                infilters = dense_shape[0]
+                infilters = z_shape[0]
             else:
                 infilters = nlastfilters * pow(2, layers_cnt - i)
+            outfilters = nlastfilters * pow(2, layers_cnt - i - 1)
+
             self.GenConvModel.add_module(f'ConvTranspose_{i}', nn.ConvTranspose2d(infilters, outfilters, filter_size, 2,
                                                                                   padding, output_padding=1))
             self.GenConvModel.add_module(f'BN_{i}', nn.BatchNorm2d(outfilters))
@@ -49,15 +42,13 @@ class Generator(nn.Module):
         self.GenConvModel.add_module('LastLReLU', nn.LeakyReLU(lrelu_coef, True))
 
     def forward(self, x):
-        x = self.GenDenseModel(x)
-        x = x.view(x.shape[0], *self.dense_shape)
         x = self.GenConvModel(x)
 
         return x
 
 
 class Discriminator(nn.Module):
-    def __init__(self, img_shape: Tuple[int], generator_params: dict,
+    def __init__(self, img_shape: Tuple[int, ...], generator_params: dict,
                  generator_type: str = 'dcnn_classes'):
         super(Discriminator, self).__init__()
         self.img_shape = img_shape

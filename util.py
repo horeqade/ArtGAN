@@ -1,4 +1,26 @@
 import tensorflow._api.v1.keras.backend as K
+import shutil
+import torch
+from os.path import join, exists
+from os import getcwd, makedirs
+from datetime import date
+
+
+def model_saver(generator: torch.nn.Module, discriminator: torch.nn.Module, epoch: int):
+    save_path = join(getcwd(), 'saved_model')
+    date_today = date.today()
+    month, day = date_today.month, date_today.day
+
+    model_folder = join(save_path, f'model_{day}.{month}_{epoch}')
+    generator_folder = join(model_folder, 'generator.pth')
+    discriminator_folder = join(model_folder, 'discriminator.pth')
+
+    if exists(model_folder):
+        shutil.rmtree(model_folder, ignore_errors=False)
+    makedirs(model_folder)
+
+    torch.save({'model_state_dict': generator.state_dict()}, generator_folder)
+    torch.save({'model_state_dict': discriminator.state_dict()}, discriminator_folder)
 
 
 def get_layer_output_grad(model, inputs, outputs, layer=-1):
