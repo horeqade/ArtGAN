@@ -16,7 +16,7 @@ class Generator(nn.Module):
         self.generator_type = generator_type
         if generator_type == 'dcnn':
             self.GenConvModel = nn.Sequential()
-            self.build_dcnn_generator(**generator_params)
+            self.build_dcnn_generator_v2(**generator_params)
 
     def build_dcnn_generator(self, z_shape: Tuple[int], nlastfilters: int = 64,
                              filter_size: Tuple[int] = (3, 3), lrelu_coef: float = 0.2):
@@ -32,14 +32,50 @@ class Generator(nn.Module):
                 infilters = nlastfilters * pow(2, layers_cnt - i)
             outfilters = nlastfilters * pow(2, layers_cnt - i - 1)
 
+            infilters = min(infilters, 256)
+            outfilters = min(outfilters, 256)
+
             self.GenConvModel.add_module(f'ConvTranspose_{i}', nn.ConvTranspose2d(infilters, outfilters, filter_size, 2,
                                                                                   padding, output_padding=1))
             self.GenConvModel.add_module(f'BN_{i}', nn.BatchNorm2d(outfilters))
             self.GenConvModel.add_module(f'LReLU_{i}', nn.LeakyReLU(lrelu_coef, True))
 
+            self.GenConvModel.add_module(f'Conv_{i}',
+                                         nn.Conv2d(outfilters, outfilters, filter_size, padding=padding))
+            self.GenConvModel.add_module(f'BN_{i}', nn.BatchNorm2d(outfilters))
+            self.GenConvModel.add_module(f'LReLU_{i}', nn.LeakyReLU(lrelu_coef, True))
+
         self.GenConvModel.add_module('FinalConvTranspose',
-                        nn.ConvTranspose2d(nlastfilters, self.img_shape[0], filter_size, 1, padding))
-        self.GenConvModel.add_module('LastLReLU', nn.LeakyReLU(lrelu_coef, True))
+                                     nn.ConvTranspose2d(nlastfilters, self.img_shape[0], filter_size, 1, padding))
+        self.GenConvModel.add_module('Tanh', nn.Tanh())
+
+    def build_dcnn_generator_v2(self, z_shape: Tuple[int], init_filters: int = 1024,
+                             filter_size: Tuple[int] = (3, 3), lrelu_coef: float = 0.2):
+        img_width = self.img_shape[1]
+        layers_cnt = int(log2(img_width))
+        padding = int((filter_size[0] - 1) / 2)
+
+        infilters = 0
+        outfilters = 0
+        for i in range(layers_cnt):
+            if infilters == 0:
+                infilters = z_shape[0]
+            else:
+                infilters = outfilters
+            if outfilters == 0:
+                outfilters = init_filters
+            else:
+                outfilters = int(infilters/2)
+
+            self.GenConvModel.add_module(f'ConvTranspose_{i}', nn.ConvTranspose2d(infilters, outfilters, filter_size, 2,
+                                                                                  padding, output_padding=1))
+            self.GenConvModel.add_module(f'BN_{i}', nn.BatchNorm2d(outfilters))
+            self.GenConvModel.add_module(f'LReLU_{i}', nn.LeakyReLU(lrelu_coef, True))
+
+
+        self.GenConvModel.add_module('FinalConvTranspose',
+                                     nn.ConvTranspose2d(outfilters, self.img_shape[0], filter_size, 1, padding))
+        self.GenConvModel.add_module('Tanh', nn.Tanh())
 
     def forward(self, x):
         x = self.GenConvModel(x)
@@ -63,35 +99,38 @@ class Discriminator(nn.Module):
 
         self.Featurizer = nn.Sequential()
 
-        self.Featurizer.add_module(f'FeaturizerConv_0', nn.Conv2d(self.img_shape[0], init_filter_cnt, filter_size, 2, padding))
+        self.Featurizer.add_module(f'FeaturizerConv_0',
+                                   nn.Conv2d(self.img_shape[0], init_filter_cnt, filter_size, 2, padding))
         self.Featurizer.add_module(f'FeaturizerLReLU_0', nn.LeakyReLU(lrelu_coef))
 
         outfilters = init_filter_cnt * 2
         infilters = init_filter_cnt
         for i in range(self.nconv - 1):
-            self.Featurizer.add_module(f'FeaturizerConv_{i + 1}', nn.Conv2d(infilters, outfilters, filter_size, 2, padding))
+            self.Featurizer.add_module(f'FeaturizerConv_{i + 1}',
+                                       nn.Conv2d(infilters, outfilters, filter_size, 2, padding))
             self.Featurizer.add_module(f'FeaturizerBN_{i + 1}', nn.BatchNorm2d(outfilters))
             self.Featurizer.add_module(f'FeaturizerLReLU_{i + 1}', nn.LeakyReLU(lrelu_coef))
 
             infilters = outfilters
             outfilters *= 2
 
-        out_size = int(self.img_shape[1]/pow(2, conv_cnt))
+        out_size = int(self.img_shape[1] / pow(2, conv_cnt))
         nfeats = infilters * out_size * out_size
         self.ValidModel = nn.Sequential(
             nn.Linear(nfeats, 1)
         )
         self.ClassModel = nn.Sequential(
-            nn.Linear(nfeats, 512),
+            nn.Linear(nfeats, 256),
             nn.LeakyReLU(lrelu_coef),
-            nn.Linear(512, 256),
+            nn.Linear(256, 128),
             nn.LeakyReLU(lrelu_coef),
-            nn.Linear(256, self.n_classes),
+            nn.Linear(128, self.n_classes)
         )
 
     def forward(self, x):
         x = self.Featurizer(x)
         x = x.view(x.shape[0], -1)
+
 
         valid = self.ValidModel(x)
         classification = self.ClassModel(x)
